@@ -1,331 +1,349 @@
 
-import os
-import sqlite3
-from datetime import datetime
+import os, re, json, sqlite3, time
 from pathlib import Path
+from datetime import datetime
 
 import streamlit as st
 from dotenv import load_dotenv
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-LOG_DIR = BASE_DIR / "logs"
-SCREENSHOT_DIR = BASE_DIR / "screenshots"
-DB_PATH = DATA_DIR / "taskdock.db"
+load_dotenv()
 
-DATA_DIR.mkdir(exist_ok=True)
-LOG_DIR.mkdir(exist_ok=True)
-SCREENSHOT_DIR.mkdir(exist_ok=True)
+BASE = Path(__file__).resolve().parent
+DB = BASE / "taskdock.db"
+PROFILES = BASE / "browser_profiles"
+SCREENSHOTS = BASE / "screenshots"
+LOGS = BASE / "logs"
+for p in (PROFILES, SCREENSHOTS, LOGS):
+    p.mkdir(exist_ok=True)
 
-load_dotenv(BASE_DIR / ".env")
-
+PLAYWRIGHT_ENABLED = os.getenv("PLAYWRIGHT_ENABLED", "true").lower() == "true"
+FAMSUP_MODE = os.getenv("FAMSUP_MODE", "browser_session")
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
-FAMSUP_MODE = os.getenv("FAMSUP_MODE", "manual")
-FAMSUP_OFFICIAL_API_ENABLED = os.getenv("FAMSUP_OFFICIAL_API_ENABLED", "false").lower() == "true"
-FAMSUP_BROWSER_AUTOMATION_ENABLED = os.getenv("FAMSUP_BROWSER_AUTOMATION_ENABLED", "false").lower() == "true"
-
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    return c
 
 def init_db():
-    with db() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS accounts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                platform TEXT NOT NULL,
-                account_name TEXT NOT NULL,
-                profile_url TEXT DEFAULT '',
-                notes TEXT DEFAULT '',
-                created_at TEXT NOT NULL
-            );
+    c = db()
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS accounts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        service TEXT NOT NULL,
+        account_name TEXT NOT NULL,
+        profile_label TEXT NOT NULL,
+        profile_url TEXT DEFAULT '',
+        notes TEXT DEFAULT '',
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        famsup_id TEXT DEFAULT '',
+        title TEXT NOT NULL,
+        platform TEXT DEFAULT '',
+        action TEXT DEFAULT '',
+        target_url TEXT DEFAULT '',
+        reward TEXT DEFAULT '',
+        instructions TEXT DEFAULT '',
+        username TEXT DEFAULT '',
+        verification TEXT DEFAULT '',
+        status TEXT DEFAULT 'Available',
+        selected_account_id INTEGER,
+        proof_path TEXT DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER,
+        event_type TEXT NOT NULL,
+        details TEXT DEFAULT '',
+        created_at TEXT NOT NULL
+    );
+    """)
+    c.commit(); c.close()
 
-            CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                platform TEXT DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'Pending',
-                due_date TEXT DEFAULT '',
-                notes TEXT DEFAULT '',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
+def now():
+    return datetime.now().isoformat(timespec="seconds")
 
-            CREATE TABLE IF NOT EXISTS evidence (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id INTEGER NOT NULL,
-                filename TEXT NOT NULL,
-                stored_path TEXT NOT NULL,
-                uploaded_at TEXT NOT NULL,
-                FOREIGN KEY(task_id) REFERENCES tasks(id)
-            );
-            """
-        )
+def log_event(task_id, event_type, details=""):
+    c = db()
+    c.execute("INSERT INTO events(task_id,event_type,details,created_at) VALUES(?,?,?,?)",
+              (task_id, event_type, details, now()))
+    c.commit(); c.close()
 
+def add_task(**kw):
+    c = db()
+    t = now()
+    cur = c.execute("""INSERT INTO tasks
+      (famsup_id,title,platform,action,target_url,reward,instructions,username,verification,status,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+      (kw.get("famsup_id",""),kw.get("title","Untitled"),kw.get("platform",""),
+       kw.get("action",""),kw.get("target_url",""),kw.get("reward",""),
+       kw.get("instructions",""),kw.get("username",""),kw.get("verification",""),
+       kw.get("status","Available"),t,t))
+    c.commit(); tid = cur.lastrowid; c.close()
+    log_event(tid, "task_imported", "Imported into TaskDock")
+    return tid
 
-def add_account(platform, account_name, profile_url, notes):
-    now = datetime.now().isoformat(timespec="seconds")
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO accounts(platform, account_name, profile_url, notes, created_at) VALUES (?, ?, ?, ?, ?)",
-            (platform, account_name, profile_url, notes, now),
-        )
+def update_task(tid, **kw):
+    if not kw: return
+    kw["updated_at"] = now()
+    sets = ", ".join(f"{k}=?" for k in kw)
+    vals = list(kw.values()) + [tid]
+    c = db(); c.execute(f"UPDATE tasks SET {sets} WHERE id=?", vals); c.commit(); c.close()
 
+def tasks(status=None):
+    c = db()
+    if status:
+        rows = c.execute("SELECT * FROM tasks WHERE status=? ORDER BY id DESC",(status,)).fetchall()
+    else:
+        rows = c.execute("SELECT * FROM tasks ORDER BY id DESC").fetchall()
+    c.close(); return rows
 
-def add_task(title, platform, due_date, notes):
-    now = datetime.now().isoformat(timespec="seconds")
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO tasks(title, platform, status, due_date, notes, created_at, updated_at) VALUES (?, ?, 'Pending', ?, ?, ?, ?)",
-            (title, platform, due_date, notes, now, now),
-        )
+def accounts(service=None):
+    c = db()
+    if service:
+        rows = c.execute("SELECT * FROM accounts WHERE service=? ORDER BY id DESC",(service,)).fetchall()
+    else:
+        rows = c.execute("SELECT * FROM accounts ORDER BY id DESC").fetchall()
+    c.close(); return rows
 
+def add_account(service, account_name, profile_label, profile_url="", notes=""):
+    c=db()
+    c.execute("""INSERT INTO accounts(service,account_name,profile_label,profile_url,notes,created_at)
+                 VALUES(?,?,?,?,?,?)""",(service,account_name,profile_label,profile_url,notes,now()))
+    c.commit(); c.close()
 
-def update_task_status(task_id, status):
-    now = datetime.now().isoformat(timespec="seconds")
-    with db() as conn:
-        conn.execute(
-            "UPDATE tasks SET status=?, updated_at=? WHERE id=?",
-            (status, now, task_id),
-        )
+def parser(text):
+    t = text.strip()
+    low = t.lower()
+    platform = next((x for x in ["YouTube","Instagram","Facebook","TikTok","X","Snapchat"] if x.lower() in low), "")
+    action = ""
+    for k in ["subscribe","follow","like","comment","view"]:
+        if k in low:
+            action = k.title(); break
+    urls = re.findall(r'https?://[^\s)>\]]+', t)
+    reward = ""
+    m = re.search(r'(?:₦|ngn)\s*[\d,.]+', t, re.I)
+    if m: reward = m.group(0)
+    fam = ""
+    m = re.search(r'(?:task\s*id|famsup\s*id)\s*[:#-]?\s*([A-Za-z0-9_-]+)', t, re.I)
+    if m: fam = m.group(1)
+    title = f"{platform} {action}".strip() or "FamsUp task"
+    return dict(famsup_id=fam,title=title,platform=platform,action=action,
+                target_url=urls[0] if urls else "",reward=reward,instructions=t)
 
+def launch_browser(profile_label, start_url=""):
+    if not PLAYWRIGHT_ENABLED:
+        st.error("Playwright is disabled in .env")
+        return None
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        st.error(f"Playwright unavailable: {e}")
+        return None
+    pw = sync_playwright().start()
+    profile = PROFILES / re.sub(r"[^A-Za-z0-9_.-]+","_",profile_label)
+    profile.mkdir(exist_ok=True)
+    browser = pw.chromium.launch_persistent_context(str(profile), headless=False)
+    page = browser.pages[0] if browser.pages else browser.new_page()
+    if start_url:
+        page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
+    st.session_state.setdefault("browsers", {})[profile_label] = (pw,browser,page)
+    return page
 
-def save_evidence(task_id, uploaded_file):
-    safe_name = Path(uploaded_file.name).name
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    target = SCREENSHOT_DIR / f"{timestamp}_{safe_name}"
-    target.write_bytes(uploaded_file.getbuffer())
+def get_page(profile_label):
+    b = st.session_state.get("browsers", {}).get(profile_label)
+    return b[2] if b else None
 
-    now = datetime.now().isoformat(timespec="seconds")
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO evidence(task_id, filename, stored_path, uploaded_at) VALUES (?, ?, ?, ?)",
-            (task_id, safe_name, str(target.relative_to(BASE_DIR)), now),
-        )
+def close_browsers():
+    for pw,browser,page in list(st.session_state.get("browsers", {}).values()):
+        try: browser.close()
+        except: pass
+        try: pw.stop()
+        except: pass
+    st.session_state["browsers"] = {}
 
-
-def get_accounts():
-    with db() as conn:
-        return conn.execute("SELECT * FROM accounts ORDER BY id DESC").fetchall()
-
-
-def get_tasks():
-    with db() as conn:
-        return conn.execute("SELECT * FROM tasks ORDER BY id DESC").fetchall()
-
-
-def get_evidence():
-    with db() as conn:
-        return conn.execute(
-            """
-            SELECT evidence.*, tasks.title
-            FROM evidence
-            JOIN tasks ON tasks.id = evidence.task_id
-            ORDER BY evidence.id DESC
-            """
-        ).fetchall()
-
+def capture(tid, page):
+    path = SCREENSHOTS / f"task_{tid}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+    page.screenshot(path=str(path), full_page=True)
+    update_task(tid, proof_path=str(path), status="Proof captured")
+    log_event(tid,"proof_captured",str(path))
+    return path
 
 init_db()
-
-st.set_page_config(page_title="TaskDock", page_icon="🗂️", layout="wide")
-
-st.title("🗂️ TaskDock")
-st.caption("Local task management and evidence workspace for authorized social accounts.")
+st.set_page_config(page_title="TaskDock", page_icon="⚡", layout="wide")
+st.title("⚡ TaskDock")
+st.caption("FamsUp task workspace • local browser sessions • human-confirmed social actions")
 
 with st.sidebar:
-    st.header("Operating mode")
-    st.write(f"DRY_RUN: {'ON' if DRY_RUN else 'OFF'}")
-    st.write(f"FamsUp mode: `{FAMSUP_MODE}`")
-    st.write(
-        "Official FamsUp API: "
-        + ("enabled" if FAMSUP_OFFICIAL_API_ENABLED else "disabled")
-    )
-    st.write(
-        "Browser automation: "
-        + ("enabled" if FAMSUP_BROWSER_AUTOMATION_ENABLED else "disabled")
-    )
-    st.info(
-        "Safe default: manage tasks and evidence locally. Do not use this app "
-        "to bypass CAPTCHA, platform restrictions, or automate fake engagement."
-    )
+    st.header("Connections")
+    st.success("FamsUp session" if st.session_state.get("famsup_connected") else "FamsUp not connected")
+    social = {a["service"] for a in accounts()}
+    st.write("Social sessions:", ", ".join(sorted(social)) if social else "None")
+    if st.button("Close all browser sessions"):
+        close_browsers()
+        st.session_state["famsup_connected"] = False
+        st.rerun()
 
-tabs = st.tabs(["Dashboard", "Tasks", "Accounts", "Evidence", "FamsUp Handoff"])
+tabs = st.tabs(["⚡ Task Inbox","▶ Execute","🔐 Connections","📥 Sync FamsUp","📸 Evidence","⚙ Settings"])
 
 with tabs[0]:
-    tasks = get_tasks()
-    accounts = get_accounts()
-    evidence = get_evidence()
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Tasks", len(tasks))
-    c2.metric("Pending", sum(t["status"] == "Pending" for t in tasks))
-    c3.metric("Completed", sum(t["status"] == "Completed" for t in tasks))
-    c4.metric("Evidence files", len(evidence))
-
-    st.subheader("Recent tasks")
-    if tasks:
-        st.dataframe(
-            [
-                {
-                    "ID": t["id"],
-                    "Task": t["title"],
-                    "Platform": t["platform"],
-                    "Status": t["status"],
-                    "Due": t["due_date"],
-                }
-                for t in tasks[:10]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
-    else:
-        st.info("No tasks yet. Add your first task from the Tasks tab.")
+    st.subheader("FamsUp Task Inbox")
+    all_tasks = tasks()
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Available", sum(x["status"]=="Available" for x in all_tasks))
+    c2.metric("Working", sum(x["status"] in ("Working","Proof captured") for x in all_tasks))
+    c3.metric("Proof ready", sum(bool(x["proof_path"]) for x in all_tasks))
+    c4.metric("Submitted", sum(x["status"]=="Submitted" for x in all_tasks))
+    if not all_tasks:
+        st.info("No tasks yet. Connect FamsUp and use Sync FamsUp, or paste a task in the Sync tab.")
+    for t in all_tasks:
+        with st.container(border=True):
+            a,b,c = st.columns([5,2,1])
+            with a:
+                st.markdown(f"**{t['title']}**")
+                st.caption(f"{t['platform']} • {t['action']} • {t['reward'] or 'reward unknown'}")
+                if t["target_url"]: st.code(t["target_url"], language=None)
+            with b:
+                st.write(t["status"])
+                st.write("📸 Proof attached" if t["proof_path"] else "No proof")
+            with c:
+                if st.button("Execute", key=f"exec_{t['id']}"):
+                    st.session_state["selected_task"] = t["id"]; st.rerun()
 
 with tabs[1]:
-    st.subheader("Create task")
-    with st.form("task_form"):
-        title = st.text_input("Task title")
-        platform = st.selectbox(
-            "Platform",
-            ["", "TikTok", "X", "Facebook", "Instagram", "YouTube", "Other"],
-        )
-        due_date = st.date_input("Due date")
-        notes = st.text_area("Notes")
-        submitted = st.form_submit_button("Add task")
-        if submitted:
-            if not title.strip():
-                st.error("Task title is required.")
-            else:
-                add_task(title.strip(), platform, str(due_date), notes.strip())
-                st.success("Task added.")
-                st.rerun()
+    st.subheader("Execute")
+    all_tasks = tasks()
+    if not all_tasks:
+        st.info("Import or sync a FamsUp task first.")
+    else:
+        ids=[t["id"] for t in all_tasks]
+        default = st.session_state.get("selected_task", ids[0])
+        tid = st.selectbox("Task", ids, index=ids.index(default) if default in ids else 0,
+                           format_func=lambda x: next(t["title"] for t in all_tasks if t["id"]==x))
+        t = next(x for x in all_tasks if x["id"]==tid)
+        st.session_state["selected_task"]=tid
+        st.write(f"**{t['action']}** on **{t['platform']}** — {t['reward'] or 'reward unknown'}")
+        st.write(t["instructions"])
+        if t["target_url"]: st.code(t["target_url"], language=None)
 
-    st.subheader("Manage tasks")
-    tasks = get_tasks()
-    for task in tasks:
-        with st.container(border=True):
-            left, right = st.columns([4, 1])
-            with left:
-                st.write(f"**#{task['id']} — {task['title']}**")
-                st.caption(f"{task['platform'] or 'General'} · Due {task['due_date'] or 'Not set'}")
-                if task["notes"]:
-                    st.write(task["notes"])
-            with right:
-                new_status = st.selectbox(
-                    "Status",
-                    ["Pending", "In Progress", "Completed", "Blocked"],
-                    index=["Pending", "In Progress", "Completed", "Blocked"].index(task["status"]),
-                    key=f"status_{task['id']}",
-                    label_visibility="collapsed",
-                )
-                if new_status != task["status"]:
-                    update_task_status(task["id"], new_status)
-                    st.rerun()
+        opts=[a for a in accounts(t["platform"]) if a["service"]==t["platform"]]
+        if not opts:
+            opts=accounts()
+        if opts:
+            labels=[f"{a['service']} — {a['account_name']} [{a['profile_label']}]" for a in opts]
+            ai=st.selectbox("Authorized social session", range(len(opts)), format_func=lambda i:labels[i])
+            acct=opts[ai]
+            update_task(tid, selected_account_id=acct["id"], status="Working")
+            st.caption(f"Browser profile: `{acct['profile_label']}`")
+            c1,c2,c3=st.columns(3)
+            if c1.button("1. Open session + target", type="primary"):
+                page=get_page(acct["profile_label"])
+                if not page: page=launch_browser(acct["profile_label"], t["target_url"])
+                elif t["target_url"]: page.goto(t["target_url"], wait_until="domcontentloaded", timeout=30000)
+                log_event(tid,"target_opened",t["target_url"])
+                st.success("Target opened. Log in normally if required.")
+            if c2.button("2. Assist action"):
+                page=get_page(acct["profile_label"])
+                if not page:
+                    st.warning("Open the session first.")
+                else:
+                    # Safe assistance: locate and highlight likely controls; do not click.
+                    keywords = [t["action"].lower()]
+                    if t["action"].lower()=="subscribe": keywords += ["subscribed"]
+                    if t["action"].lower()=="follow": keywords += ["following"]
+                    if t["action"].lower()=="like": keywords += ["liked"]
+                    count = page.locator("button, a, [role=button]").count()
+                    found = 0
+                    for i in range(min(count,150)):
+                        try:
+                            el=page.locator("button, a, [role=button]").nth(i)
+                            txt=(el.inner_text(timeout=300) or "").strip().lower()
+                            if any(k in txt for k in keywords):
+                                el.scroll_into_view_if_needed(timeout=1000)
+                                el.evaluate("""e => { e.style.outline='4px solid orange'; e.style.outlineOffset='3px'; }""")
+                                found += 1
+                                break
+                        except: pass
+                    st.info("Action control highlighted. **You must click it yourself.**" if found else
+                            "Could not reliably locate the control. Find it manually, then use Check action.")
+            if c3.button("3. Check action + capture proof"):
+                page=get_page(acct["profile_label"])
+                if not page: st.warning("Open the session first.")
+                else:
+                    txt=page.locator("body").inner_text(timeout=3000).lower()
+                    action=t["action"].lower()
+                    indicators = {
+                        "subscribe":["subscribed","unsubscribe"],
+                        "follow":["following","unfollow"],
+                        "like":["unlike","liked"]
+                    }.get(action,[])
+                    detected=any(x in txt for x in indicators)
+                    if detected:
+                        path=capture(tid,page)
+                        st.success(f"Completed state detected. Proof captured: {path.name}")
+                    else:
+                        st.warning("Completed state was not confidently detected. You can perform the action and try again.")
+        else:
+            st.warning("Connect an authorized social account first.")
 
 with tabs[2]:
-    st.subheader("Authorized account records")
-    with st.form("account_form"):
-        platform = st.selectbox(
-            "Platform",
-            ["TikTok", "X", "Facebook", "Instagram", "YouTube", "Other"],
-        )
-        account_name = st.text_input("Account name / handle")
-        profile_url = st.text_input("Profile URL (optional)")
-        notes = st.text_area("Notes (optional)")
-        submitted = st.form_submit_button("Add account")
-        if submitted:
-            if not account_name.strip():
-                st.error("Account name / handle is required.")
-            else:
-                add_account(platform, account_name.strip(), profile_url.strip(), notes.strip())
-                st.success("Account record added.")
-                st.rerun()
-
-    accounts = get_accounts()
-    if accounts:
-        st.dataframe(
-            [
-                {
-                    "ID": a["id"],
-                    "Platform": a["platform"],
-                    "Account": a["account_name"],
-                    "Profile": a["profile_url"],
-                    "Notes": a["notes"],
-                }
-                for a in accounts
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
-    else:
-        st.info("No authorized account records yet.")
+    st.subheader("🔐 Connections")
+    st.write("Use local persistent browser profiles. Passwords, cookies and tokens are not stored in TaskDock's database.")
+    st.markdown("### FamsUpTasks")
+    if st.button("Open FamsUp Login", key="famsup_login"):
+        page=launch_browser("famsup_main","https://famsuptasks.com/")
+        st.session_state["famsup_connected"]=True
+        log_event(None,"famsup_session_opened","User login is completed in browser")
+        st.success("FamsUp browser session opened. Log in normally in that window.")
+    st.divider()
+    st.markdown("### Social accounts")
+    services=["YouTube","Instagram","Facebook","TikTok","X","Snapchat"]
+    for svc in services:
+        with st.expander(svc):
+            name=st.text_input("Account/handle", key=f"name_{svc}")
+            label=st.text_input("Browser profile label", value=svc.lower()+"_main", key=f"profile_{svc}")
+            if st.button(f"Open {svc} login", key=f"open_{svc}"):
+                add_account(svc,name or svc,label)
+                page=launch_browser(label)
+                st.success(f"{svc} browser profile opened. Log in normally in that window.")
+                log_event(None,"social_session_opened",svc)
 
 with tabs[3]:
-    st.subheader("Screenshot / evidence upload")
-    tasks = get_tasks()
-    if not tasks:
-        st.warning("Create a task before attaching evidence.")
-    else:
-        task_options = {f"#{t['id']} — {t['title']}": t["id"] for t in tasks}
-        selected = st.selectbox("Task", list(task_options))
-        uploaded = st.file_uploader(
-            "Upload screenshot evidence",
-            type=["png", "jpg", "jpeg", "webp"],
-        )
-        if uploaded and st.button("Save evidence"):
-            save_evidence(task_options[selected], uploaded)
-            st.success("Evidence saved locally.")
-            st.rerun()
-
-    evidence = get_evidence()
-    if evidence:
-        st.subheader("Evidence history")
-        st.dataframe(
-            [
-                {
-                    "Task": e["title"],
-                    "File": e["filename"],
-                    "Stored path": e["stored_path"],
-                    "Uploaded": e["uploaded_at"],
-                }
-                for e in evidence
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
+    st.subheader("📥 Sync FamsUp")
+    st.warning("TaskDock does not pretend an undocumented FamsUp API exists. This sync mode uses the authenticated FamsUp browser session and user-visible task content.")
+    if st.button("Open/refresh FamsUp task page", type="primary"):
+        page=get_page("famsup_main")
+        if not page: page=launch_browser("famsup_main","https://famsuptasks.com/")
+        else: page.reload(wait_until="domcontentloaded", timeout=30000)
+        st.success("FamsUp opened. Navigate to the task list in the browser.")
+    st.markdown("### Import visible task text")
+    text=st.text_area("Paste copied FamsUp task text here", height=180)
+    if st.button("Import task"):
+        if text.strip():
+            d=parser(text); tid=add_task(**d)
+            st.success(f"Imported task #{tid}: {d['title']}")
+        else: st.warning("Paste task text first.")
+    st.markdown("### JSON import")
+    raw=st.text_area("Task JSON", value='{"title":"YouTube Subscribe","platform":"YouTube","action":"Subscribe","target_url":"https://youtube.com/"}', height=120)
+    if st.button("Import JSON"):
+        try:
+            d=json.loads(raw); tid=add_task(**d); st.success(f"Imported task #{tid}")
+        except Exception as e: st.error(str(e))
 
 with tabs[4]:
-    st.subheader("FamsUp handoff")
-    st.write(
-        "This safe build prepares information for a manual handoff. It does not "
-        "perform undocumented browser automation or automatic login."
-    )
+    st.subheader("📸 Evidence")
+    for t in tasks():
+        if t["proof_path"] and Path(t["proof_path"]).exists():
+            st.markdown(f"**Task #{t['id']} — {t['title']}**")
+            st.image(t["proof_path"], use_container_width=True)
 
-    tasks = get_tasks()
-    completed = [t for t in tasks if t["status"] == "Completed"]
-
-    if completed:
-        selected = st.selectbox(
-            "Completed task",
-            [f"#{t['id']} — {t['title']}" for t in completed],
-        )
-        selected_id = int(selected.split("—")[0].replace("#", "").strip())
-
-        related = [e for e in get_evidence() if e["task_id"] == selected_id]
-        st.write(f"Evidence attached: **{len(related)}**")
-
-        if st.button("Mark ready for manual FamsUp handoff"):
-            st.success(
-                "Task marked ready. Open FamsUp separately and complete the "
-                "authorized submission/upload manually."
-            )
-    else:
-        st.info("Complete a task first, then prepare its evidence for handoff.")
-
-st.divider()
-st.caption("TaskDock • Local-first • Safe-by-default")
+with tabs[5]:
+    st.subheader("⚙ Settings")
+    st.write("DRY_RUN:", DRY_RUN)
+    st.write("FAMSUP_MODE:", FAMSUP_MODE)
+    st.write("PLAYWRIGHT_ENABLED:", PLAYWRIGHT_ENABLED)
+    st.caption("Human-confirmed engagement is intentional: TaskDock can navigate, locate, verify and capture proof, but it does not press Like/Follow/Subscribe buttons automatically.")
