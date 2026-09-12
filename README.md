@@ -1,93 +1,49 @@
-# TaskDock Streamlit
+# TaskDock — FamsUp Session & Maximum-Automation Assistant
 
-TaskDock is a local-first Streamlit workspace for organizing tasks, authorized social-account records, screenshot evidence, and manual FamsUp handoffs.
+TaskDock is a local Streamlit workspace for organizing FamsUp tasks and authorized social-account browser sessions.
 
-## Features
+## Workflow
 
-- Task creation and status tracking
-- Authorized account records for supported social platforms
-- Local screenshot/evidence storage
-- SQLite local database
-- Evidence history
-- Manual FamsUp handoff workflow
-- Safe-by-default configuration
-- No credentials stored in the database
-- No undocumented browser automation
-- No CAPTCHA bypass or fake engagement automation
+1. Open **Connections → FamsUpTasks → Open FamsUp Login** and log in normally.
+2. Add/open each authorized social account and log in in its own persistent browser profile.
+3. Use **Sync FamsUp** to work from the authenticated FamsUp browser session or import visible task text/JSON.
+4. In **Execute**, select the correct social session.
+5. **Open session + target**.
+6. **Assist action** locates/highlights the likely control.
+7. You click the Like/Follow/Subscribe control yourself.
+8. **Check action + capture proof** verifies a completed-state indicator where possible and automatically captures the screenshot.
+9. Proof is attached to the task and shown in Evidence.
 
-## Project structure
+## Security
 
-```text
-taskdock_streamlit/
-├── app.py
-├── README.md
-├── requirements.txt
-├── .env.example
-├── .gitignore
-├── data/
-│   └── .gitkeep
-├── logs/
-│   └── .gitkeep
-└── screenshots/
-    └── .gitkeep
-```
+- Credentials are entered by the user in the browser.
+- TaskDock does not store social/FamsUp passwords in SQLite.
+- Persistent Playwright profiles are local under `browser_profiles/`.
+- Do not commit browser profiles, screenshots, logs, `.env`, or the SQLite database.
+- Do not bypass CAPTCHA, anti-bot controls, rate limits, or access controls.
 
-## Windows setup
+## FamsUp integration
 
+No undocumented API is assumed. Browser-session sync is deliberately user-visible and depends on the current FamsUp site UI. If FamsUp provides an authorized API later, it can be added as a separate adapter.
+
+## Install
+
+Windows:
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\activate
-python -m pip install --upgrade pip
+.venv\Scripts\activate
 pip install -r requirements.txt
 copy .env.example .env
+playwright install chromium
 streamlit run app.py
 ```
 
-## macOS / Linux
-
+macOS/Linux:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
 pip install -r requirements.txt
 cp .env.example .env
-streamlit run app.py
-```
-
-## Safe defaults
-
-`.env.example` uses:
-
-```env
-DRY_RUN=true
-FAMSUP_MODE=manual
-FAMSUP_OFFICIAL_API_ENABLED=false
-FAMSUP_BROWSER_AUTOMATION_ENABLED=false
-```
-
-Keep these defaults unless you have a legitimate, documented integration and authorization to enable an official API.
-
-## GitHub safety
-
-The `.gitignore` intentionally excludes:
-
-- `.env` and local secrets
-- Streamlit secrets
-- SQLite/database files
-- screenshots
-- logs
-- Python virtual environments
-- Python cache files
-- local data
-
-Only `.env.example` is intended to be committed.
-
-## Security note
-
-Do not place passwords, session cookies, API tokens, recovery codes, or other credentials in this repository or in the local database. Use the platform's official authentication mechanisms and official APIs where available.
-
-## Running
-
-```bash
+playwright install chromium
 streamlit run app.py
 ```
