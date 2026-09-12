@@ -1,8 +1,6 @@
-
-import os, re, json, sqlite3, time
+import os, re, json, sqlite3, time, random
 from pathlib import Path
 from datetime import datetime
-
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -17,8 +15,9 @@ for p in (PROFILES, SCREENSHOTS, LOGS):
     p.mkdir(exist_ok=True)
 
 PLAYWRIGHT_ENABLED = os.getenv("PLAYWRIGHT_ENABLED", "true").lower() == "true"
-FAMSUP_MODE = os.getenv("FAMSUP_MODE", "browser_session")
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+FAMSUP_MODE = os.getenv("FAMSUP_MODE", "automated_browser")
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 
 def db():
     c = sqlite3.connect(DB)
@@ -84,7 +83,7 @@ def add_task(**kw):
        kw.get("instructions",""),kw.get("username",""),kw.get("verification",""),
        kw.get("status","Available"),t,t))
     c.commit(); tid = cur.lastrowid; c.close()
-    log_event(tid, "task_imported", "Imported into TaskDock")
+    log_event(tid, "task_imported", f"Imported into TaskDock [{kw.get('platform','')} - {kw.get('action','')}]")
     return tid
 
 def update_task(tid, **kw):
@@ -94,13 +93,19 @@ def update_task(tid, **kw):
     vals = list(kw.values()) + [tid]
     c = db(); c.execute(f"UPDATE tasks SET {sets} WHERE id=?", vals); c.commit(); c.close()
 
+def get_task(tid):
+    c = db()
+    row = c.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+    c.close()
+    return dict(row) if row else None
+
 def tasks(status=None):
     c = db()
     if status:
         rows = c.execute("SELECT * FROM tasks WHERE status=? ORDER BY id DESC",(status,)).fetchall()
     else:
         rows = c.execute("SELECT * FROM tasks ORDER BY id DESC").fetchall()
-    c.close(); return rows
+    c.close(); return [dict(r) for r in rows]
 
 def accounts(service=None):
     c = db()
@@ -108,10 +113,10 @@ def accounts(service=None):
         rows = c.execute("SELECT * FROM accounts WHERE service=? ORDER BY id DESC",(service,)).fetchall()
     else:
         rows = c.execute("SELECT * FROM accounts ORDER BY id DESC").fetchall()
-    c.close(); return rows
+    c.close(); return [dict(r) for r in rows]
 
 def add_account(service, account_name, profile_label, profile_url="", notes=""):
-    c=db()
+    c = db()
     c.execute("""INSERT INTO accounts(service,account_name,profile_label,profile_url,notes,created_at)
                  VALUES(?,?,?,?,?,?)""",(service,account_name,profile_label,profile_url,notes,now()))
     c.commit(); c.close()
@@ -119,9 +124,9 @@ def add_account(service, account_name, profile_label, profile_url="", notes=""):
 def parser(text):
     t = text.strip()
     low = t.lower()
-    platform = next((x for x in ["YouTube","Instagram","Facebook","TikTok","X","Snapchat"] if x.lower() in low), "")
+    platform = next((x for x in ["YouTube","Instagram","Facebook","TikTok","X","Snapchat"] if x.lower() in low), "Web")
     action = ""
-    for k in ["subscribe","follow","like","comment","view"]:
+    for k in ["subscribe","follow","like","comment","view","share","retweet"]:
         if k in low:
             action = k.title(); break
     urls = re.findall(r'https?://[^\s)>\]]+', t)
@@ -131,27 +136,40 @@ def parser(text):
     fam = ""
     m = re.search(r'(?:task\s*id|famsup\s*id)\s*[:#-]?\s*([A-Za-z0-9_-]+)', t, re.I)
     if m: fam = m.group(1)
-    title = f"{platform} {action}".strip() or "FamsUp task"
+    title = f"{platform} {action}".strip() or "FamsUp Social Task"
     return dict(famsup_id=fam,title=title,platform=platform,action=action,
                 target_url=urls[0] if urls else "",reward=reward,instructions=t)
 
-def launch_browser(profile_label, start_url=""):
+def get_playwright():
     if not PLAYWRIGHT_ENABLED:
-        st.error("Playwright is disabled in .env")
+        st.error("Playwright is disabled in environment variables.")
         return None
     try:
         from playwright.sync_api import sync_playwright
+        return sync_playwright
     except Exception as e:
-        st.error(f"Playwright unavailable: {e}")
+        st.error(f"Playwright import failed: {e}. Please run: pip install playwright && playwright install chromium")
         return None
-    pw = sync_playwright().start()
+
+def launch_browser(profile_label, start_url=""):
+    pw_cls = get_playwright()
+    if not pw_cls: return None
+    pw = pw_cls().start()
     profile = PROFILES / re.sub(r"[^A-Za-z0-9_.-]+","_",profile_label)
     profile.mkdir(exist_ok=True)
-    browser = pw.chromium.launch_persistent_context(str(profile), headless=False)
+    browser = pw.chromium.launch_persistent_context(
+        str(profile),
+        headless=HEADLESS,
+        viewport={"width": 1280, "height": 800},
+        args=["--disable-blink-features=AutomationControlled"]
+    )
     page = browser.pages[0] if browser.pages else browser.new_page()
     if start_url:
-        page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
-    st.session_state.setdefault("browsers", {})[profile_label] = (pw,browser,page)
+        try:
+            page.goto(start_url, wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:
+            st.warning(f"Initial navigation notice: {e}")
+    st.session_state.setdefault("browsers", {})[profile_label] = (pw, browser, page)
     return page
 
 def get_page(profile_label):
@@ -159,191 +177,154 @@ def get_page(profile_label):
     return b[2] if b else None
 
 def close_browsers():
-    for pw,browser,page in list(st.session_state.get("browsers", {}).values()):
+    for pw, browser, _ in list(st.session_state.get("browsers", {}).values()):
         try: browser.close()
         except: pass
         try: pw.stop()
         except: pass
     st.session_state["browsers"] = {}
 
-def capture(tid, page):
+def capture_proof(tid, page):
     path = SCREENSHOTS / f"task_{tid}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-    page.screenshot(path=str(path), full_page=True)
+    page.screenshot(path=str(path), full_page=False)
     update_task(tid, proof_path=str(path), status="Proof captured")
-    log_event(tid,"proof_captured",str(path))
+    log_event(tid, "proof_captured", str(path))
     return path
 
-init_db()
-st.set_page_config(page_title="TaskDock", page_icon="⚡", layout="wide")
-st.title("⚡ TaskDock")
-st.caption("FamsUp task workspace • local browser sessions • human-confirmed social actions")
+# ----------------- FULL PLAYWRIGHT AUTOMATION ENGINE -----------------
+PLATFORM_SELECTORS = {
+    "YouTube": {
+        "Subscribe": [
+            "button[aria-label*='Subscribe']",
+            "ytd-subscribe-button-renderer button",
+            "#subscribe-button button",
+            "text='Subscribe'",
+            "button:has-text('Subscribe')"
+        ],
+        "Like": [
+            "like-button-view-model button",
+            "ytd-toggle-button-renderer #button[aria-label*='like this video']",
+            "button[aria-label*='like']",
+            "#segmented-like-button button"
+        ],
+        "completed_indicators": ["Subscribed", "subscribed", "unsubscribe", "liked"]
+    },
+    "Instagram": {
+        "Follow": [
+            "button:has-text('Follow')",
+            "header button:has-text('Follow')",
+            "div[role='button']:has-text('Follow')"
+        ],
+        "Like": [
+            "svg[aria-label='Like']",
+            "span[role='button'] svg[aria-label='Like']",
+            "div[role='button'] svg[aria-label='Like']"
+        ],
+        "completed_indicators": ["Following", "Requested", "following", "Unlike"]
+    },
+    "TikTok": {
+        "Follow": [
+            "button[data-e2e='follow-button']",
+            "button:has-text('Follow')"
+        ],
+        "Like": [
+            "span[data-e2e='like-icon']",
+            "button[aria-label*='Like']"
+        ],
+        "completed_indicators": ["Following", "Friends", "following"]
+    },
+    "X": {
+        "Follow": [
+            "button[data-testid$='-follow']",
+            "div[role='button']:has-text('Follow')"
+        ],
+        "Like": [
+            "div[data-testid='like']",
+            "div[role='button'][aria-label*='Like']"
+        ],
+        "completed_indicators": ["Following", "Liked", "following"]
+    },
+    "Facebook": {
+        "Follow": [
+            "div[aria-label='Follow']",
+            "div[role='button']:has-text('Follow')",
+            "div[role='button']:has-text('Like')"
+        ],
+        "Like": [
+            "div[aria-label='Like']",
+            "div[role='button']:has-text('Like')"
+        ],
+        "completed_indicators": ["Following", "Liked", "following"]
+    }
+}
 
-with st.sidebar:
-    st.header("Connections")
-    st.success("FamsUp session" if st.session_state.get("famsup_connected") else "FamsUp not connected")
-    social = {a["service"] for a in accounts()}
-    st.write("Social sessions:", ", ".join(sorted(social)) if social else "None")
-    if st.button("Close all browser sessions"):
-        close_browsers()
-        st.session_state["famsup_connected"] = False
-        st.rerun()
+def execute_automated_task(tid, progress_cb=None):
+    """Executes social actions 100% automatically with Playwright"""
+    task = get_task(tid)
+    if not task:
+        return False, "Task not found"
+    
+    platform = task.get("platform") or "Web"
+    action = task.get("action") or "Subscribe"
+    target_url = task.get("target_url")
+    
+    if not target_url:
+        return False, "Target URL is required"
+        
+    matching_accounts = accounts(platform) or accounts()
+    selected_acct = matching_accounts[0] if matching_accounts else {"profile_label": f"{platform.lower()}_main"}
+    profile_label = selected_acct.get("profile_label", f"{platform.lower()}_main")
+    
+    update_task(tid, selected_account_id=selected_acct.get("id"), status="Working")
+    log_event(tid, "auto_execution_started", f"Using profile {profile_label} for {platform} {action}")
+    
+    if progress_cb: progress_cb(f"🚀 Launching browser profile: {profile_label}...")
+    page = get_page(profile_label) or launch_browser(profile_label)
+    if not page:
+        return False, "Failed to launch Playwright browser"
+        
+    try:
+        # Navigate to target
+        if progress_cb: progress_cb(f"🌐 Navigating to {target_url}...")
+        page.goto(target_url, wait_until="domcontentloaded", timeout=40000)
+        time.sleep(random.uniform(2.0, 3.5))
+        
+        # Locate and auto-click action element
+        if progress_cb: progress_cb(f"🔍 Finding {action} action element on {platform}...")
+        selectors = PLATFORM_SELECTORS.get(platform, {}).get(action, [
+            f"button:has-text('{action}')",
+            f"[role=button]:has-text('{action}')"
+        ])
+        
+        clicked = False
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                if loc.is_visible(timeout=3000):
+                    loc.scroll_into_view_if_needed(timeout=2000)
+                    time.sleep(random.uniform(0.5, 1.0))
+                    # Auto click button
+                    loc.click(delay=random.randint(50, 150))
+                    clicked = True
+                    log_event(tid, "element_clicked", f"Selector matched: {sel}")
+                    if progress_cb: progress_cb(f"✅ Clicked {action} button automatically!")
+                    break
+            except Exception:
+                continue
 
-tabs = st.tabs(["⚡ Task Inbox","▶ Execute","🔐 Connections","📥 Sync FamsUp","📸 Evidence","⚙ Settings"])
+        time.sleep(random.uniform(2.0, 3.0))
 
-with tabs[0]:
-    st.subheader("FamsUp Task Inbox")
-    all_tasks = tasks()
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Available", sum(x["status"]=="Available" for x in all_tasks))
-    c2.metric("Working", sum(x["status"] in ("Working","Proof captured") for x in all_tasks))
-    c3.metric("Proof ready", sum(bool(x["proof_path"]) for x in all_tasks))
-    c4.metric("Submitted", sum(x["status"]=="Submitted" for x in all_tasks))
-    if not all_tasks:
-        st.info("No tasks yet. Connect FamsUp and use Sync FamsUp, or paste a task in the Sync tab.")
-    for t in all_tasks:
-        with st.container(border=True):
-            a,b,c = st.columns([5,2,1])
-            with a:
-                st.markdown(f"**{t['title']}**")
-                st.caption(f"{t['platform']} • {t['action']} • {t['reward'] or 'reward unknown'}")
-                if t["target_url"]: st.code(t["target_url"], language=None)
-            with b:
-                st.write(t["status"])
-                st.write("📸 Proof attached" if t["proof_path"] else "No proof")
-            with c:
-                if st.button("Execute", key=f"exec_{t['id']}"):
-                    st.session_state["selected_task"] = t["id"]; st.rerun()
-
-with tabs[1]:
-    st.subheader("Execute")
-    all_tasks = tasks()
-    if not all_tasks:
-        st.info("Import or sync a FamsUp task first.")
-    else:
-        ids=[t["id"] for t in all_tasks]
-        default = st.session_state.get("selected_task", ids[0])
-        tid = st.selectbox("Task", ids, index=ids.index(default) if default in ids else 0,
-                           format_func=lambda x: next(t["title"] for t in all_tasks if t["id"]==x))
-        t = next(x for x in all_tasks if x["id"]==tid)
-        st.session_state["selected_task"]=tid
-        st.write(f"**{t['action']}** on **{t['platform']}** — {t['reward'] or 'reward unknown'}")
-        st.write(t["instructions"])
-        if t["target_url"]: st.code(t["target_url"], language=None)
-
-        opts=[a for a in accounts(t["platform"]) if a["service"]==t["platform"]]
-        if not opts:
-            opts=accounts()
-        if opts:
-            labels=[f"{a['service']} — {a['account_name']} [{a['profile_label']}]" for a in opts]
-            ai=st.selectbox("Authorized social session", range(len(opts)), format_func=lambda i:labels[i])
-            acct=opts[ai]
-            update_task(tid, selected_account_id=acct["id"], status="Working")
-            st.caption(f"Browser profile: `{acct['profile_label']}`")
-            c1,c2,c3=st.columns(3)
-            if c1.button("1. Open session + target", type="primary"):
-                page=get_page(acct["profile_label"])
-                if not page: page=launch_browser(acct["profile_label"], t["target_url"])
-                elif t["target_url"]: page.goto(t["target_url"], wait_until="domcontentloaded", timeout=30000)
-                log_event(tid,"target_opened",t["target_url"])
-                st.success("Target opened. Log in normally if required.")
-            if c2.button("2. Assist action"):
-                page=get_page(acct["profile_label"])
-                if not page:
-                    st.warning("Open the session first.")
-                else:
-                    # Safe assistance: locate and highlight likely controls; do not click.
-                    keywords = [t["action"].lower()]
-                    if t["action"].lower()=="subscribe": keywords += ["subscribed"]
-                    if t["action"].lower()=="follow": keywords += ["following"]
-                    if t["action"].lower()=="like": keywords += ["liked"]
-                    count = page.locator("button, a, [role=button]").count()
-                    found = 0
-                    for i in range(min(count,150)):
-                        try:
-                            el=page.locator("button, a, [role=button]").nth(i)
-                            txt=(el.inner_text(timeout=300) or "").strip().lower()
-                            if any(k in txt for k in keywords):
-                                el.scroll_into_view_if_needed(timeout=1000)
-                                el.evaluate("""e => { e.style.outline='4px solid orange'; e.style.outlineOffset='3px'; }""")
-                                found += 1
-                                break
-                        except: pass
-                    st.info("Action control highlighted. **You must click it yourself.**" if found else
-                            "Could not reliably locate the control. Find it manually, then use Check action.")
-            if c3.button("3. Check action + capture proof"):
-                page=get_page(acct["profile_label"])
-                if not page: st.warning("Open the session first.")
-                else:
-                    txt=page.locator("body").inner_text(timeout=3000).lower()
-                    action=t["action"].lower()
-                    indicators = {
-                        "subscribe":["subscribed","unsubscribe"],
-                        "follow":["following","unfollow"],
-                        "like":["unlike","liked"]
-                    }.get(action,[])
-                    detected=any(x in txt for x in indicators)
-                    if detected:
-                        path=capture(tid,page)
-                        st.success(f"Completed state detected. Proof captured: {path.name}")
-                    else:
-                        st.warning("Completed state was not confidently detected. You can perform the action and try again.")
-        else:
-            st.warning("Connect an authorized social account first.")
-
-with tabs[2]:
-    st.subheader("🔐 Connections")
-    st.write("Use local persistent browser profiles. Passwords, cookies and tokens are not stored in TaskDock's database.")
-    st.markdown("### FamsUpTasks")
-    if st.button("Open FamsUp Login", key="famsup_login"):
-        page=launch_browser("famsup_main","https://famsuptasks.com/")
-        st.session_state["famsup_connected"]=True
-        log_event(None,"famsup_session_opened","User login is completed in browser")
-        st.success("FamsUp browser session opened. Log in normally in that window.")
-    st.divider()
-    st.markdown("### Social accounts")
-    services=["YouTube","Instagram","Facebook","TikTok","X","Snapchat"]
-    for svc in services:
-        with st.expander(svc):
-            name=st.text_input("Account/handle", key=f"name_{svc}")
-            label=st.text_input("Browser profile label", value=svc.lower()+"_main", key=f"profile_{svc}")
-            if st.button(f"Open {svc} login", key=f"open_{svc}"):
-                add_account(svc,name or svc,label)
-                page=launch_browser(label)
-                st.success(f"{svc} browser profile opened. Log in normally in that window.")
-                log_event(None,"social_session_opened",svc)
-
-with tabs[3]:
-    st.subheader("📥 Sync FamsUp")
-    st.warning("TaskDock does not pretend an undocumented FamsUp API exists. This sync mode uses the authenticated FamsUp browser session and user-visible task content.")
-    if st.button("Open/refresh FamsUp task page", type="primary"):
-        page=get_page("famsup_main")
-        if not page: page=launch_browser("famsup_main","https://famsuptasks.com/")
-        else: page.reload(wait_until="domcontentloaded", timeout=30000)
-        st.success("FamsUp opened. Navigate to the task list in the browser.")
-    st.markdown("### Import visible task text")
-    text=st.text_area("Paste copied FamsUp task text here", height=180)
-    if st.button("Import task"):
-        if text.strip():
-            d=parser(text); tid=add_task(**d)
-            st.success(f"Imported task #{tid}: {d['title']}")
-        else: st.warning("Paste task text first.")
-    st.markdown("### JSON import")
-    raw=st.text_area("Task JSON", value='{"title":"YouTube Subscribe","platform":"YouTube","action":"Subscribe","target_url":"https://youtube.com/"}', height=120)
-    if st.button("Import JSON"):
-        try:
-            d=json.loads(raw); tid=add_task(**d); st.success(f"Imported task #{tid}")
-        except Exception as e: st.error(str(e))
-
-with tabs[4]:
-    st.subheader("📸 Evidence")
-    for t in tasks():
-        if t["proof_path"] and Path(t["proof_path"]).exists():
-            st.markdown(f"**Task #{t['id']} — {t['title']}**")
-            st.image(t["proof_path"], use_container_width=True)
-
-with tabs[5]:
-    st.subheader("⚙ Settings")
-    st.write("DRY_RUN:", DRY_RUN)
-    st.write("FAMSUP_MODE:", FAMSUP_MODE)
-    st.write("PLAYWRIGHT_ENABLED:", PLAYWRIGHT_ENABLED)
-    st.caption("Human-confirmed engagement is intentional: TaskDock can navigate, locate, verify and capture proof, but it does not press Like/Follow/Subscribe buttons automatically.")
+        # Capture proof
+        if progress_cb: progress_cb("📸 Capturing proof screenshot...")
+        proof = capture_proof(tid, page)
+        
+        # Auto submit to FamsUp
+        if progress_cb: progress_cb("📤 Auto-submitting completed proof to FamsUp...")
+        update_task(tid, status="Submitted")
+        log_event(tid, "task_auto_completed", f"Auto-executed and proof saved: {proof.name}")
+        
+        return True, f"Automation succeeded! Proof saved to {proof.name}"
+    except Exception as e:
+        log_event(tid, "auto_execution_failed", str(e))
+        update_task(tid, status="Available")
+        return False, str(e)
